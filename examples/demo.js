@@ -9,7 +9,9 @@
  *   3. 并发刷新同一刷新令牌：恰好一个成功，另一个触发整家族撤销；
  *   4. 家族撤销后，连最新访问令牌也立即失效；
  *   5. 范围越权（A 申请未开放的 write:docs）在签发阶段被拒；
- *   6. 重启后已轮换/已撤销的状态仍然有效。
+ *   6. 重启后已轮换/已撤销的状态仍然有效；
+ *   7. 部分撤销写权限：旧码/旧令牌/刷新轮换立即失去写范围、读范围保留，
+ *      重新授权后旧凭据不复活，只有新签发凭据恢复写权限，且不连带另一客户端。
  */
 
 const fs = require('node:fs');
@@ -169,7 +171,88 @@ async function main() {
     }),
   );
 
-  console.log('\n── 7. 重启持久化：关闭服务后用同一数据库文件重新启动 ──');
+  console.log('\n── 7. 部分撤销写权限（保留读权限）后重新授权 ──');
+  const postScopeGrant = (clientId, scopes, granted) =>
+    fetch(`${baseUrl}/scope-grant`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ clientId, scopes, granted }),
+    }).then(async (res) => {
+      const body = await res.json();
+      if (!res.ok) throw Object.assign(new Error(body.error_description), { status: res.status, body });
+      return body;
+    });
+
+  // 撤销前：先签发一张含读写两个范围的新码，但暂不兑换
+  const preParams = clientB.startAuthorization();
+  const { code: preRevokeCode } = await userApprovesAndIssues(baseUrl, CLIENT_B, {
+    codeChallenge: preParams.codeChallenge,
+    scopes: ['read:profile', 'write:documents'],
+  });
+  // 同时拿一组已存在的令牌
+  const bParams = clientB.startAuthorization();
+  const { code: bCode } = await userApprovesAndIssues(baseUrl, CLIENT_B, {
+    codeChallenge: bParams.codeChallenge,
+    scopes: ['read:profile', 'write:documents'],
+  });
+  const bTokens = await clientB.exchangeCode(bCode, bParams.codeVerifier);
+  console.log('  撤销前 B 的令牌范围:', (await clientB.callResource(bTokens.accessToken)).scope.join(' '));
+
+  // 只撤销 B 的写范围
+  await postScopeGrant(CLIENT_B.clientId, ['write:documents'], false);
+  console.log('  已撤销 B 的 write:documents（保留 read:profile）');
+
+  // 已签发的访问令牌立即失去写范围、读范围保留
+  const narrowed = await clientB.callResource(bTokens.accessToken);
+  console.log('  旧访问令牌现在的范围:', narrowed.scope.join(' '));
+
+  // 撤销前签发的旧码兑换时被收窄
+  const fromOldCode = await clientB.exchangeCode(preRevokeCode, preParams.codeVerifier);
+  console.log('  撤销前旧码兑换出的范围:', fromOldCode.scope.join(' '));
+
+  // 刷新轮换出的新令牌也只有读范围
+  const refreshed = await clientB.refresh(bTokens.refreshToken);
+  console.log('  刷新轮换后新令牌范围:', refreshed.scope.join(' '));
+
+  // 撤销期间不能签发含写范围的新码
+  const revokeParams = clientB.startAuthorization();
+  await describeError(
+    '撤销期间签发含写范围的新码',
+    userApprovesAndIssues(baseUrl, CLIENT_B, {
+      codeChallenge: revokeParams.codeChallenge,
+      scopes: ['read:profile', 'write:documents'],
+    }),
+  );
+
+  // 重新授权写范围：旧家族仍拿不回写范围（授权纪元已推进）
+  await postScopeGrant(CLIENT_B.clientId, ['write:documents'], true);
+  const refreshedAfterRegrant = await clientB.refresh(refreshed.refreshToken);
+  console.log('  重新授权后旧家族刷新出的范围:', refreshedAfterRegrant.scope.join(' '), '（写范围不复活）');
+
+  // 重新授权之后新签发的码/令牌才恢复写范围
+  const afterParams = clientB.startAuthorization();
+  const { code: afterCode } = await userApprovesAndIssues(baseUrl, CLIENT_B, {
+    codeChallenge: afterParams.codeChallenge,
+    scopes: ['read:profile', 'write:documents'],
+  });
+  const afterTokens = await clientB.exchangeCode(afterCode, afterParams.codeVerifier);
+  console.log('  重新授权后新令牌范围:', afterTokens.scope.sort().join(' '));
+
+  // A 的凭据不受 B 撤销连带影响（tokensA 的家族在第 4 节已被重放撤销，
+  // 这里重新签发一组独立的新令牌用于隔离验证）
+  const aIsoParams = clientA.startAuthorization();
+  const { code: aIsoCode } = await userApprovesAndIssues(baseUrl, CLIENT_A, {
+    codeChallenge: aIsoParams.codeChallenge,
+    scopes: ['read:profile', 'read:documents'],
+  });
+  const aIsoTokens = await clientA.exchangeCode(aIsoCode, aIsoParams.codeVerifier);
+  const aStill = await clientA.callResource(aIsoTokens.accessToken).catch(() => null);
+  console.log(
+    '  B 的撤销不连带 A：A 新签发的访问令牌',
+    aStill ? `仍有效（${aStill.scope.join(' ')}）` : '已失效（异常）',
+  );
+
+  console.log('\n── 8. 重启持久化：关闭服务后用同一数据库文件重新启动 ──');
   await new Promise((resolve) => server.close(resolve));
   auth.close();
   const auth2 = new AuthService({ db: DB_FILE, clock: new Clock() });

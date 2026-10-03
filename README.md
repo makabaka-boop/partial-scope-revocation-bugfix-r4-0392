@@ -42,7 +42,7 @@ src/
   main.js      启动入口，登记两个模拟客户端
 examples/
   demo.js      两个客户端经真实 HTTP 的端到端演示
-test/          node:test 测试（26 个用例）
+test/          node:test 测试（40 个用例）
 ```
 
 ## 使用
@@ -64,7 +64,8 @@ better-sqlite3 不同的行为做了收口：绑定参数必须以单个数组�
 | --- | --- |
 | `POST /authorize` | 用户确认范围后签发授权码：`clientId, redirectUri, codeChallenge, codeChallengeMethod, scopes` |
 | `POST /token` | `grantType: "authorization_code"`（`code, redirectUri, codeVerifier`）或 `"refresh_token"`（`refreshToken, scopes`） |
-| `POST /introspect` | 校验访问令牌：`accessToken` |
+| `POST /introspect` | 校验访问令牌：`accessToken`（返回按当前授权状态收窄后的范围） |
+| `POST /scope-grant` | 部分撤销/重新授权：`clientId, scopes, granted` |
 | `POST /revoke` | 撤销家族：`familyId, reason` |
 
 ## 测试覆盖要点
@@ -84,4 +85,19 @@ better-sqlite3 不同的行为做了收口：绑定参数必须以单个数组�
   旧码旧令牌不复活；未撤销家族重启后仍可正常轮换。
 
 ## 部分范围撤销
-POST /scope-grant 接受 clientId、scopes 和 granted 布尔值。撤销仅针对这个客户端，保留的范围继续可用。撤销后的旧授权码、旧访问及刷新凭据不应重新获得该范围；再次授权只对之后签发的授权码和凭据生效。全部范围失效的兑换不得签发令牌。原有到期、一次性消费和家族重放撤销仍生效。
+
+`POST /scope-grant` 接受 `clientId`、`scopes` 和 `granted` 布尔值，在写事务内持久化
+**每客户端每范围**的授权状态与**授权纪元 `grant_version`**（撤销/重新授权导致状态翻转时 +1）。
+授权码（`auth_code_scopes`）与令牌家族（`token_family_scopes`）在签发时快照各自范围的纪元。
+
+- **仅针对该客户端**：撤销 B 的某范围不连带 A（即使两客户端范围同名）。
+- **旧凭据立即收窄**：撤销后，撤销前签发的旧授权码（兑换时）、旧访问令牌（introspect 时）
+  与刷新轮换出的新令牌都不再携带该范围；保留的范围继续有效。
+- **重新授权不复活旧凭据**：再授权会推进纪元，旧码/旧家族的快照版本对不上，写范围不会回来；
+  只有之后新签发的授权码与凭据才带该范围。
+- **全部范围失效**的码兑换/令牌刷新一律拒绝：码兑换在原子消费之后提交拒绝（码不可重放、不发令牌），
+  刷新在消费刷新令牌之前拒绝（不轮换、不签发、不留令牌）。
+- 撤销期间含被撤销范围的新 `/authorize` 请求在签发阶段即被 `invalid_scope` 拒绝。
+- 状态全部落盘：重启后收窄结果、纪元与拒绝行为完全一致；对升级前的旧库有幂等回填（默认授权 v1）。
+- 与原有性质正交：到期判断、一次性消费、重放即家族撤销在部分撤销下行为不变；
+  家族被撤销时整家族优先失效。

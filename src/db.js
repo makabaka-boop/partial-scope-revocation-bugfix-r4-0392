@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS client_scopes (
   PRIMARY KEY (client_id, scope)
 );
 
+-- 每客户端每范围的授权状态 + 授权纪元（部分撤销）。
+-- granted=0 表示该客户端的该范围已撤销；grant_version 在状态翻转时 +1，
+-- 供 auth_code_scopes / token_family_scopes 的签发快照比对。
+CREATE TABLE IF NOT EXISTS scope_grants (
+  client_id     TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+  scope         TEXT NOT NULL,
+  granted       INTEGER NOT NULL,
+  grant_version INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (client_id, scope)
+);
+
 CREATE TABLE IF NOT EXISTS auth_codes (
   code_hash             TEXT PRIMARY KEY,
   client_id             TEXT NOT NULL REFERENCES clients(client_id),
@@ -69,6 +81,15 @@ CREATE TABLE IF NOT EXISTS auth_codes (
   created_at_ms         INTEGER NOT NULL
 );
 
+-- 授权码对每个范围在签发时刻快照的 grant_version：
+-- 兑换时范围当前仍 granted 且版本未变才保留，否则被部分撤销剔除。
+CREATE TABLE IF NOT EXISTS auth_code_scopes (
+  code_hash     TEXT NOT NULL REFERENCES auth_codes(code_hash) ON DELETE CASCADE,
+  scope         TEXT NOT NULL,
+  grant_version INTEGER NOT NULL,
+  PRIMARY KEY (code_hash, scope)
+);
+
 CREATE TABLE IF NOT EXISTS token_families (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   client_id     TEXT NOT NULL REFERENCES clients(client_id),
@@ -76,6 +97,16 @@ CREATE TABLE IF NOT EXISTS token_families (
   revoked_at_ms INTEGER,
   revoke_reason TEXT,
   created_at_ms INTEGER NOT NULL
+);
+
+-- 令牌家族对每个原始范围在首次兑换时快照的 grant_version。
+-- 刷新/校验时范围当前仍 granted 且版本未变才保留；
+-- 撤销后重新授权会推进版本，家族旧快照对不上 => 旧凭据无法重获该范围。
+CREATE TABLE IF NOT EXISTS token_family_scopes (
+  family_id     INTEGER NOT NULL REFERENCES token_families(id) ON DELETE CASCADE,
+  scope         TEXT NOT NULL,
+  grant_version INTEGER NOT NULL,
+  PRIMARY KEY (family_id, scope)
 );
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -256,9 +287,55 @@ class Db {
   }
 }
 
-/** 幂等建表（重启 / 多实例启动时安全）。仅应在无其他连接竞争时执行。 */
+/**
+ * 幂等建表（重启 / 多实例启动时安全）。仅应在无其他连接竞争时执行。
+ *
+ * 建表后对升级前就存在的旧数据做一次幂等回填：
+ * - client_scopes 中已开放但 scope_grants 缺行的范围 => 默认已授权 v1；
+ * - 旧授权码 / 旧令牌家族的 space 分隔范围 => 快照 v1。
+ * 回填前从未发生过撤销，因此“当前 v1 已授权 + 凭据快照 v1”恰好保留全部旧范围；
+ * 一旦之后撤销，照常按版本收窄。全部用 NOT EXISTS 守卫，重复执行无副作用。
+ */
 function migrate(db) {
   db.exec(SCHEMA_SQL);
+
+  const selectScopes = db._db.prepare('SELECT client_id, scope FROM client_scopes');
+  const clientScopes = selectScopes.all();
+  try {
+    const insertGrant = db._db.prepare(
+      `INSERT OR IGNORE INTO scope_grants
+         (client_id, scope, granted, grant_version, updated_at_ms)
+       VALUES (?, ?, 1, 1, 0)`,
+    );
+    try {
+      for (const { client_id: clientId, scope } of clientScopes) {
+        insertGrant.run([clientId, scope]);
+      }
+    } finally {
+      insertGrant.finalize();
+    }
+
+    const insertCodeScope = db._db.prepare(
+      `INSERT OR IGNORE INTO auth_code_scopes (code_hash, scope, grant_version)
+       SELECT code_hash, ?, 1 FROM auth_codes WHERE scope IS NOT NULL`,
+    );
+    const insertFamilyScope = db._db.prepare(
+      `INSERT OR IGNORE INTO token_family_scopes (family_id, scope, grant_version)
+       SELECT id, ?, 1 FROM token_families WHERE scope IS NOT NULL`,
+    );
+    try {
+      for (const scope of new Set(clientScopes.map((r) => r.scope))) {
+        insertCodeScope.run([scope]);
+        insertFamilyScope.run([scope]);
+      }
+    } finally {
+      insertCodeScope.finalize();
+      insertFamilyScope.finalize();
+    }
+  } finally {
+    // SELECT 语句同样需要显式 finalize，避免残留 SHARED 读锁
+    selectScopes.finalize();
+  }
 }
 
 module.exports = { Db, Mutex, migrate, SCHEMA_SQL };
