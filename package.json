@@ -1,0 +1,15 @@
+{
+  "name": "auth-service",
+  "version": "1.0.0",
+  "description": "授权码模式授权服务（PKCE、刷新令牌轮换与家族撤销、SQLite 持久化、可注入时钟）",
+  "main": "src/server.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node src/main.js",
+    "demo": "node examples/demo.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "node-sqlite3-wasm": "^0.8.60"
+  }
+}
