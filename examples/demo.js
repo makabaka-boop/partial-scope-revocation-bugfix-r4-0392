@@ -169,7 +169,49 @@ async function main() {
     }),
   );
 
-  console.log('\n── 7. 重启持久化：关闭服务后用同一数据库文件重新启动 ──');
+  console.log('\n── 7. 部分撤销：只撤销 B 的写权限，读保留；重新授权不复活旧凭据 ──');
+  // 全新客户端 B 流程，撤销前签发一张读+写的码（不兑换）
+  const pBefore = clientB.startAuthorization();
+  const { code: codeBeforeRevoke } = await userApprovesAndIssues(baseUrl, CLIENT_B, {
+    codeChallenge: pBefore.codeChallenge,
+    scopes: ['read:profile', 'write:documents'],
+  });
+  const tokensBefore = await clientB.exchangeCode(codeBeforeRevoke, pBefore.codeVerifier);
+  console.log(
+    '  撤销前令牌范围:',
+    (await clientB.callResource(tokensBefore.accessToken)).scope.join(' '),
+  );
+
+  await fetch(`${baseUrl}/scope-grant`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientId: CLIENT_B.clientId, scopes: ['write:documents'], granted: false }),
+  });
+  const afterRevoke = await clientB.callResource(tokensBefore.accessToken);
+  console.log('  撤销写后，旧访问令牌剩余范围:', afterRevoke.scope.join(' '));
+  const rotated = await clientB.refresh(tokensBefore.refreshToken);
+  console.log('  撤销后轮换的新令牌范围:', rotated.scope.join(' '), '（写范围无法由旧凭据重新获得）');
+
+  // 重新授权：只对之后签发的凭据生效
+  await fetch(`${baseUrl}/scope-grant`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientId: CLIENT_B.clientId, scopes: ['write:documents'], granted: true }),
+  });
+  const rotatedOld = await clientB.refresh(rotated.refreshToken);
+  console.log('  重新授权后，旧家族轮换范围:', rotatedOld.scope.join(' '), '（旧凭据不恢复写）');
+  const pNew = clientB.startAuthorization();
+  const { code: codeAfterGrant } = await userApprovesAndIssues(baseUrl, CLIENT_B, {
+    codeChallenge: pNew.codeChallenge,
+    scopes: ['read:profile', 'write:documents'],
+  });
+  const tokensNew = await clientB.exchangeCode(codeAfterGrant, pNew.codeVerifier);
+  console.log('  重新授权后新签发令牌范围:', tokensNew.scope.sort().join(' '), '（新凭据完整读+写）');
+  // 另一客户端 A 不受连带影响
+  const aInfo = await clientA.callResource(tokensA.accessToken).catch((e) => e.body);
+  console.log('  另一客户端 A 的撤销状态不受影响（其家族此前因重放已撤销）:', aInfo.error || aInfo.scope);
+
+  console.log('\n── 8. 重启持久化：关闭服务后用同一数据库文件重新启动 ──');
   await new Promise((resolve) => server.close(resolve));
   auth.close();
   const auth2 = new AuthService({ db: DB_FILE, clock: new Clock() });

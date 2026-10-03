@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS client_scopes (
   PRIMARY KEY (client_id, scope)
 );
 
+CREATE TABLE IF NOT EXISTS scope_grants (
+  client_id     TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+  scope         TEXT NOT NULL,
+  granted       INTEGER NOT NULL, -- 0 = 当前已撤销；1 = 撤销后又重新授权
+  gen           INTEGER NOT NULL, -- 授权世代：每次 granted 状态翻转 +1，旧凭据绑定旧世代
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (client_id, scope)
+);
+
 CREATE TABLE IF NOT EXISTS auth_codes (
   code_hash             TEXT PRIMARY KEY,
   client_id             TEXT NOT NULL REFERENCES clients(client_id),
@@ -64,6 +73,7 @@ CREATE TABLE IF NOT EXISTS auth_codes (
   code_challenge        TEXT NOT NULL,
   code_challenge_method TEXT NOT NULL,
   scope                 TEXT NOT NULL,
+  scope_gens            TEXT, -- 签发时的 {scope, gen} 快照（JSON）；兑换时据此过滤已撤销范围
   expires_at_ms         INTEGER NOT NULL,
   redeemed_at_ms        INTEGER,
   created_at_ms         INTEGER NOT NULL
@@ -73,6 +83,7 @@ CREATE TABLE IF NOT EXISTS token_families (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   client_id     TEXT NOT NULL REFERENCES clients(client_id),
   scope         TEXT NOT NULL,
+  scope_gens    TEXT, -- 家族建立时的 {scope, gen} 快照；轮换链全程沿用，不随重新授权更新
   revoked_at_ms INTEGER,
   revoke_reason TEXT,
   created_at_ms INTEGER NOT NULL
@@ -256,9 +267,28 @@ class Db {
   }
 }
 
-/** 幂等建表（重启 / 多实例启动时安全）。仅应在无其他连接竞争时执行。 */
+/** 某列是否已存在于表中（老库升级时幂等补列）。 */
+function tableHasColumn(db, table, column) {
+  const stmt = db.prepare(`PRAGMA table_info(${table})`);
+  try {
+    return stmt.all().some((c) => c.name === column);
+  } finally {
+    stmt.finalize();
+  }
+}
+
+/**
+ * 幂等建表（重启 / 多实例启动时安全）。仅应在无其他连接竞争时执行。
+ * 对已存在的旧库幂等补齐部分撤销功能新增的列；列一旦加上即随事务落盘。
+ */
 function migrate(db) {
   db.exec(SCHEMA_SQL);
+  if (!tableHasColumn(db, 'auth_codes', 'scope_gens')) {
+    db.exec('ALTER TABLE auth_codes ADD COLUMN scope_gens TEXT');
+  }
+  if (!tableHasColumn(db, 'token_families', 'scope_gens')) {
+    db.exec('ALTER TABLE token_families ADD COLUMN scope_gens TEXT');
+  }
 }
 
 module.exports = { Db, Mutex, migrate, SCHEMA_SQL };

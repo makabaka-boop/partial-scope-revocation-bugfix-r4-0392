@@ -1,6 +1,6 @@
 'use strict';
 
-const {ScopeGrants}=require('./scope-grants');
+const { ScopeGrants, serializeGens, parseGens } = require('./scope-grants');
 const { Db, migrate } = require('./db');
 const { Clock } = require('./clock');
 const { AuthError } = require('./errors');
@@ -91,14 +91,16 @@ class AuthService {
     return { clientId, redirectUris, scopes: scopeList };
   }
 
-  async setScopeGrant({clientId,scopes,granted}) {
-    if(typeof granted!=='boolean')throw new AuthError('invalid_request','granted 必须为布尔值');
-    return this.db.withImmediateTx(async()=>{
-      await this._getClientOrThrow(clientId);
-      const list=await this._assertScopesAllowed(clientId,scopes);
-      await this.grants.set(clientId,list,granted);
-      return {clientId,scope:list,granted};
+  async setScopeGrant({ clientId, scopes, granted }) {
+    if (typeof granted !== 'boolean') {
+      throw new AuthError('invalid_request', 'granted 必须为布尔值');
+    }
+    const list = await this._assertScopesAllowedForGrant(clientId, scopes);
+    const now = this.clock.now();
+    await this.db.withImmediateTx(async () => {
+      await this.grants.set(clientId, list, granted, now);
     });
+    return { clientId, scope: list, granted };
   }
 
   // ---------- 用户确认授权范围后签发短期授权码 ----------
@@ -139,12 +141,14 @@ class AuthService {
     const code = generateOpaque(32);
     const now = this.clock.now();
     await this.db.withImmediateTx(async () => {
-      await this.grants.authorize(clientId,granted);
+      // 在写锁内取授权世代快照：已撤销范围直接拒签；快照随码固化，
+      // 之后的撤销/重新授权都通过世代差在兑换时体现。
+      const gens = await this.grants.snapshotForIssuance(clientId, granted);
       await this.db.run(
         `INSERT INTO auth_codes
            (code_hash, client_id, redirect_uri, code_challenge, code_challenge_method,
-            scope, expires_at_ms, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            scope, scope_gens, expires_at_ms, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           hashToken(code),
           client.client_id,
@@ -152,6 +156,7 @@ class AuthService {
           codeChallenge,
           codeChallengeMethod,
           granted.join(' '),
+          serializeGens(gens),
           now + this.ttls.codeTtlMs,
           now,
         ],
@@ -189,7 +194,7 @@ class AuthService {
     return this.db.withImmediateTx(async () => {
       const row = await this.db.get(
         `SELECT code_hash, client_id, redirect_uri, code_challenge,
-                code_challenge_method, scope, expires_at_ms, redeemed_at_ms
+                code_challenge_method, scope, scope_gens, expires_at_ms, redeemed_at_ms
          FROM auth_codes WHERE code_hash = ?`,
         [codeHash],
       );
@@ -219,6 +224,8 @@ class AuthService {
         throw new AuthError('invalid_grant', 'PKCE 验证失败');
       }
 
+      const codeScopes = row.scope.split(' ').filter(Boolean);
+
       // 原子消费：条件 UPDATE 的 changes===1 才算成功，杜绝并发双重兑换
       const consume = await this.db.run(
         `UPDATE auth_codes SET redeemed_at_ms = ?
@@ -229,11 +236,30 @@ class AuthService {
         throw new AuthError('invalid_grant', '授权码已被兑换');
       }
 
-      const scopes = row.scope.split(' ').filter(Boolean);
       if (this.hooks.afterConsume) {
         await this.hooks.afterConsume({ kind: 'code', clientId, now });
       }
-      return this._createTokensLocked(row.client_id, scopes, now);
+
+      // 部分撤销：按签发时的世代快照过滤。仍有效的范围保留在新令牌上；
+      // 全部范围均已失效（撤销或撤销后又重新授权，旧快照停在旧世代）则不签发任何令牌，
+      // 消费结果随异常一起提交（一次性码不复活，也不留下令牌）。
+      const scopes = await this.grants.effectiveScopes(
+        row.client_id,
+        codeScopes,
+        row.scope_gens,
+      );
+      if (scopes.length === 0) {
+        throw new AuthError(
+          'invalid_scope',
+          '授权范围已全部撤销，不能签发令牌',
+          400,
+          { commitAfterThrow: true },
+        );
+      }
+      // 新家族沿用授权码的世代快照（仅保留仍有效的范围）；被撤销范围的快照不复制
+      const codeGens = parseGens(row.scope_gens, codeScopes);
+      const familyGens = Object.fromEntries(scopes.map((s) => [s, codeGens[s]]));
+      return this._createTokensLocked(row.client_id, scopes, now, null, familyGens);
     });
   }
 
@@ -260,6 +286,7 @@ class AuthService {
       const row = await this.db.get(
         `SELECT rt.token_hash, rt.family_id, rt.expires_at_ms, rt.consumed_at_ms,
                 f.client_id AS family_client_id, f.scope AS family_scope,
+                f.scope_gens AS family_scope_gens,
                 f.revoked_at_ms, f.revoke_reason
          FROM refresh_tokens rt
          JOIN token_families f ON f.id = rt.family_id
@@ -294,6 +321,17 @@ class AuthService {
         }
       }
 
+      // 部分撤销：家族快照是撤销前旧世代时，被撤销/重新授权的范围在此剔除。
+      // 全部失效则拒绝（不消费刷新令牌、不发新令牌）；旧家族永远无法再获得该范围。
+      const effectiveScopes = await this.grants.effectiveScopes(
+        row.family_client_id,
+        normalizeScopes(row.family_scope),
+        row.family_scope_gens,
+      );
+      if (effectiveScopes.length === 0) {
+        throw new AuthError('invalid_scope', '授权范围已全部撤销，不能刷新令牌');
+      }
+
       // 原子消费当前刷新令牌
       const consume = await this.db.run(
         `UPDATE refresh_tokens SET consumed_at_ms = ?
@@ -305,8 +343,6 @@ class AuthService {
         await this._revokeFamilyLocked(row.family_id, now, 'reused_refresh_token');
         throw new AuthError('invalid_grant', '检测到刷新令牌重放，令牌家族已撤销', 400, { commitAfterThrow: true });
       }
-
-      const scopesList = normalizeScopes(row.family_scope);
 
       if (this.hooks.afterConsume) {
         // 持锁期间插入确定性交错点（测试用）
@@ -320,7 +356,7 @@ class AuthService {
 
       const tokens = await this._createTokensLocked(
         row.family_client_id,
-        scopesList,
+        effectiveScopes,
         now,
         row.family_id,
       );
@@ -349,7 +385,8 @@ class AuthService {
 
     const row = await this.db.get(
       `SELECT at.scope, at.expires_at_ms, at.family_id,
-              f.client_id, f.revoked_at_ms
+              f.client_id, f.scope AS family_scope, f.scope_gens AS family_scope_gens,
+              f.revoked_at_ms
        FROM access_tokens at
        JOIN token_families f ON f.id = at.family_id
        WHERE at.token_hash = ?`,
@@ -363,9 +400,19 @@ class AuthService {
     if (row.revoked_at_ms !== null) {
       throw new AuthError('invalid_token', '访问令牌已随家族撤销', 401);
     }
+    // 部分撤销：以家族签发时的世代快照实时过滤，撤销后旧访问令牌立即失去该范围；
+    // 撤销后又重新授权不会让旧令牌恢复（世代已不同）。全部失效则令牌不可用。
+    const scope = await this.grants.effectiveScopes(
+      row.client_id,
+      normalizeScopes(row.family_scope),
+      row.family_scope_gens,
+    );
+    if (scope.length === 0) {
+      throw new AuthError('invalid_token', '访问令牌的授权范围已全部撤销', 401);
+    }
     return {
       clientId: row.client_id,
-      scope: row.scope.split(' ').filter(Boolean),
+      scope,
       familyId: row.family_id,
       expiresAtMs: row.expires_at_ms,
     };
@@ -384,14 +431,17 @@ class AuthService {
   /**
    * 在当前写事务内创建一个令牌家族（首次兑换）或向既有家族追加新令牌对（轮换）。
    * 必须在 withImmediateTx 的回调中调用（调用方负责 await）。
+   *
+   * 新家族建立时固化世代快照 scopeGens；轮换（existingFamilyId 非空）时沿用
+   * 家族既有快照——重新授权只对之后新签发的凭据生效，不会借轮换注入旧家族。
    */
-  async _createTokensLocked(clientId, scopes, now, existingFamilyId = null) {
+  async _createTokensLocked(clientId, scopes, now, existingFamilyId = null, scopeGens = null) {
     let familyId = existingFamilyId;
     if (familyId === null) {
       const family = await this.db.run(
-        `INSERT INTO token_families (client_id, scope, created_at_ms)
-         VALUES (?, ?, ?)`,
-        [clientId, scopes.join(' '), now],
+        `INSERT INTO token_families (client_id, scope, scope_gens, created_at_ms)
+         VALUES (?, ?, ?, ?)`,
+        [clientId, scopes.join(' '), serializeGens(scopeGens || {}), now],
       );
       familyId = family.lastInsertRowid;
     }
@@ -473,6 +523,12 @@ class AuthService {
         '回调地址未事先登记或不是精确匹配',
       );
     }
+  }
+
+  /** setScopeGrant 的前置校验：先确认客户端存在，再确认范围对其开放。 */
+  async _assertScopesAllowedForGrant(clientId, scopes) {
+    await this._getClientOrThrow(clientId);
+    return this._assertScopesAllowed(clientId, scopes);
   }
 
   /** 请求范围必须全部在客户端允许列表内；返回归一化后的授权范围。 */

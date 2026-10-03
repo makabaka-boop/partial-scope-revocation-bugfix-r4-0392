@@ -42,14 +42,14 @@ src/
   main.js      启动入口，登记两个模拟客户端
 examples/
   demo.js      两个客户端经真实 HTTP 的端到端演示
-test/          node:test 测试（26 个用例）
+test/          node:test 测试（39 个用例）
 ```
 
 ## 使用
 
 ```bash
 npm install
-npm test          # 26 个测试
+npm test          # 39 个测试
 npm run demo      # 端到端 HTTP 演示（含并发刷新与重启）
 npm start         # 启动服务（默认 :3000，PORT / AUTH_DB 可覆盖）
 ```
@@ -66,6 +66,7 @@ better-sqlite3 不同的行为做了收口：绑定参数必须以单个数组�
 | `POST /token` | `grantType: "authorization_code"`（`code, redirectUri, codeVerifier`）或 `"refresh_token"`（`refreshToken, scopes`） |
 | `POST /introspect` | 校验访问令牌：`accessToken` |
 | `POST /revoke` | 撤销家族：`familyId, reason` |
+| `POST /scope-grant` | 部分撤销/重新授权某客户端的范围：`clientId, scopes, granted` |
 
 ## 测试覆盖要点
 
@@ -84,4 +85,18 @@ better-sqlite3 不同的行为做了收口：绑定参数必须以单个数组�
   旧码旧令牌不复活；未撤销家族重启后仍可正常轮换。
 
 ## 部分范围撤销
-POST /scope-grant 接受 clientId、scopes 和 granted 布尔值。撤销仅针对这个客户端，保留的范围继续可用。撤销后的旧授权码、旧访问及刷新凭据不应重新获得该范围；再次授权只对之后签发的授权码和凭据生效。全部范围失效的兑换不得签发令牌。原有到期、一次性消费和家族重放撤销仍生效。
+`POST /scope-grant` 接受 `clientId`、`scopes` 和 `granted` 布尔值，撤销/重新授权**仅针对这一个客户端的这些范围**。
+
+实现方式是**持久化的授权世代（grant generation）**：
+
+- `scope_grants(client_id, scope, granted, gen)` 落盘；每次 granted 状态翻转（授权→撤销、撤销→重新授权）`gen += 1`，重复相同操作幂等不叠加。
+- 授权码与令牌家族在签发时固化 `{scope: gen}` 快照；使用时（兑换/刷新/校验）以快照对照当前世代，
+  **世代不一致的范围立即从该凭据上剔除**。
+
+由此保证：
+
+1. 撤销后，撤销前的旧授权码、旧访问令牌、旧刷新令牌及其轮换结果都**不能再获得该范围**；保留范围继续有效。
+2. 撤销后又重新授权，只惠及**之后签发**的授权码与凭据；旧快照停留在旧世代，旧码/旧令牌家族不会恢复写权限。
+3. 撤销按 `(client_id, scope)` 隔离，另一客户端的凭据（含同名范围）不受连带影响。
+4. 全部范围失效的兑换/刷新一律拒绝：兑换拒绝时一次性码仍被原子消费并提交（不复活、不发令牌），刷新拒绝不消费刷新令牌、不写新令牌。
+5. 世代状态落盘，服务重启/多实例下结果一致；部分撤销不改变家族撤销语义——已用刷新令牌重放仍撤销整个家族，且最新令牌立即失效；到期与一次性消费规则保持不变。
